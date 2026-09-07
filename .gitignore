@@ -1,0 +1,5 @@
+logs/
+*.log
+test/logs/*
+!test/logs/.gitkeep
+test/shared/

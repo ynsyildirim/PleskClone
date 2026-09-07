@@ -1,0 +1,73 @@
+# ---------------------------------------------------------------------------
+# Native ARM64 Ubuntu 22.04 VM - Plesk hedef sunucusu
+#
+# Plesk Obsidian, Ubuntu 22.04 ARM64'u resmen destekler; Apple Silicon uzerinde
+# EMULASYONSUZ calisir. Apple Virtualization framework (vmType: vz) kullanilir.
+#
+# Panel: https://127.0.0.1:8444  (lima port yonlendirmesi ile)
+# ---------------------------------------------------------------------------
+vmType: vz
+os: Linux
+arch: aarch64
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+
+cpus: 4
+memory: "6GiB"
+disk: "32GiB"
+
+mountType: virtiofs
+mounts:
+  - location: "~/Documents/Projects/Helpers/PleskClone"
+    mountPoint: /opt/pleskclone-src
+    writable: false
+
+# VM'ler arasi ve host'tan dogrudan erisim icin paylasimli NAT.
+# vmType: vz ile calisir, sudo/ek kurulum GEREKTIRMEZ.
+# Varsayilan lima NAT'inda her VM ayni adresi (192.168.5.15) alir ve
+# birbirlerini goremezler; tasima testi icin bu sart.
+networks:
+  - vzNAT: true
+
+ssh:
+  localPort: 60023
+  loadDotSSHPubKeys: true
+
+portForwards:
+  # Plesk paneli
+  - guestPort: 8443
+    hostIP: "127.0.0.1"
+    hostPort: 8444
+  - guestPort: 8880
+    hostIP: "127.0.0.1"
+    hostPort: 8881
+  # site http
+  - guestPort: 80
+    hostIP: "127.0.0.1"
+    hostPort: 9081
+
+# Plesk kurulumu icin hazirlik
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      hostnamectl set-hostname plesk-b.test.local
+      grep -q plesk-b /etc/hosts || echo "127.0.1.1 plesk-b.test.local plesk-b" >> /etc/hosts
+      # Plesk 1GB swap ister
+      if [ ! -f /swapfile ]; then
+        fallocate -l 2G /swapfile
+        chmod 600 /swapfile
+        mkswap /swapfile
+        swapon /swapfile
+        echo '/swapfile none swap sw 0 0' >> /etc/fstab
+      fi
+      apt-get update -qq
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wget curl rsync git sqlite3 >/dev/null
+
+message: |
+  plesk-b hazir. Plesk kurulumu icin:
+    limactl shell plesk-b sudo /opt/pleskclone-src/test/lima/install-plesk.sh
+  Panel: https://127.0.0.1:8444

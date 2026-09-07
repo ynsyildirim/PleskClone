@@ -1,0 +1,91 @@
+# ---------------------------------------------------------------------------
+# Iki dugumlu test ortami - iki profil
+#
+#   profil "sim"  (VARSAYILAN)  native mimari, lisans gerektirmez, hizli
+#     node-a  kaynak sunucu  172.28.0.10
+#     node-b  hedef sunucu   172.28.0.11
+#
+#   profil "real"               gercek Plesk Obsidian + panel UI
+#     plesk-a  UI https://localhost:8443   172.28.0.20
+#     plesk-b  UI https://localhost:8444   172.28.0.21
+#
+# "real" profili on kosullari:
+#   1) x86_64 Linux host, VEYA Apple Silicon uzerinde Docker Desktop ayarlarinda
+#      "Use Rosetta for x86_64/amd64 emulation" ACIK olmali.
+#      (QEMU emulasyonunda Plesk lisansi sanallastirma dogrulamasindan gecmez ve
+#       panel sunucusu sw-cp-server LuaJIT VM'i baslatamaz.)
+#   2) Birden fazla domain'e izin veren gecerli bir Plesk lisans anahtari:
+#        docker exec plesk-a plesk bin license --install <ANAHTAR|AKTIVASYON-KODU>
+#      (Imajla gelen anahtar tek domain ile sinirlidir: lim_dom=1)
+#
+# Kullanim:
+#   ./run.sh all              -> sim profili ile tam test
+#   ./run.sh all real         -> gercek Plesk ile tam test
+#   ./run.sh ui real          -> panel giris linkleri
+# ---------------------------------------------------------------------------
+name: pleskclone-test
+
+x-common: &common
+  privileged: true
+  stop_grace_period: 20s
+  volumes:
+    - ../:/opt/pleskclone-src:ro
+    - ./logs:/opt/testlogs
+    - ./shared:/opt/shared
+
+services:
+
+  # ---- lisanssiz test dugumleri (varsayilan) ----
+  node-a:
+    <<: *common
+    profiles: ["sim"]
+    build: { context: ./sim }
+    image: pleskclone-test/node:latest
+    container_name: node-a
+    hostname: node-a.test.local
+    networks: { plesknet: { ipv4_address: 172.28.0.10 } }
+
+  node-b:
+    <<: *common
+    profiles: ["sim"]
+    build: { context: ./sim }
+    image: pleskclone-test/node:latest
+    container_name: node-b
+    hostname: node-b.test.local
+    networks: { plesknet: { ipv4_address: 172.28.0.11 } }
+
+  # ---- gercek Plesk Obsidian + panel UI ----
+  plesk-a:
+    <<: *common
+    profiles: ["real"]
+    build: { context: ./plesk }
+    image: pleskclone-test/plesk:latest
+    platform: linux/amd64
+    container_name: plesk-a
+    hostname: plesk-a.test.local
+    ports:
+      - "8443:8443"
+      - "8880:8880"
+      - "9080:80"
+    networks: { plesknet: { ipv4_address: 172.28.0.20 } }
+
+  plesk-b:
+    <<: *common
+    profiles: ["real"]
+    build: { context: ./plesk }
+    image: pleskclone-test/plesk:latest
+    platform: linux/amd64
+    container_name: plesk-b
+    hostname: plesk-b.test.local
+    ports:
+      - "8444:8443"
+      - "8881:8880"
+      - "9081:80"
+    networks: { plesknet: { ipv4_address: 172.28.0.21 } }
+
+networks:
+  plesknet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

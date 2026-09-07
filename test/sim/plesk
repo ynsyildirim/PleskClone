@@ -1,0 +1,642 @@
+#!/usr/bin/env bash
+# ===========================================================================
+# plesk CLI - test dugumu icin uyumluluk katmani
+#
+# Gercek Plesk Obsidian'in plesk_clone.sh tarafindan kullanilan komut yuzeyini
+# gercek psa semasi uzerinde uygular. Veritabani, sistem kullanicilari, dosya
+# sistemi, izinler, crontab GERCEKTIR; sadece komut yuzeyi burada yazilmistir.
+#
+# Bu katman yalnizca lisans gerektirmeyen bir test ortami saglamak icindir.
+# ===========================================================================
+set -uo pipefail
+
+VHOST_ROOT=/var/www/vhosts
+PSA_DB=psa
+
+mysql_root() { mysql --protocol=socket -uroot "$@"; }
+q()   { mysql_root -N -B "$PSA_DB" -e "$1" 2>/dev/null; }
+q1()  { q "$1" | head -1; }
+exec_sql() { mysql_root "$PSA_DB" -e "$1" 2>&1; }
+esc() { printf '%s' "${1//\'/\'\'}"; }
+
+adminpw() { cat /etc/psa/.psa.shadow 2>/dev/null; }
+mysql_admin() { MYSQL_PWD="$(adminpw)" mysql --protocol=socket -uadmin "$@"; }
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+# -key value seklindeki argumanlardan deger cek
+argval() {
+  local want="$1"; shift
+  while (( $# )); do
+    if [[ "$1" == "-$want" || "$1" == "--$want" ]]; then printf '%s' "${2:-}"; return 0; fi
+    shift
+  done
+  return 1
+}
+hasflag() {
+  local want="$1"; shift
+  while (( $# )); do [[ "$1" == "-$want" || "$1" == "--$want" ]] && return 0; shift; done
+  return 1
+}
+
+primary_ip() { hostname -I 2>/dev/null | awk '{print $1}'; }
+
+ensure_ip() {
+  local ip="$1"
+  [[ -z "$ip" ]] && ip="$(primary_ip)"
+  q "INSERT IGNORE INTO IP_Addresses (ip_address) VALUES ('$(esc "$ip")');" >/dev/null
+  q1 "SELECT id FROM IP_Addresses WHERE ip_address='$(esc "$ip")' LIMIT 1;"
+}
+
+dom_id()  { q1 "SELECT id FROM domains WHERE name='$(esc "$1")' LIMIT 1;"; }
+dom_sys() { q1 "SELECT su.login FROM sys_users su JOIN hosting h ON h.sys_user_id=su.id JOIN domains d ON d.id=h.dom_id WHERE d.name='$(esc "$1")' LIMIT 1;"; }
+
+# ===========================================================================
+CMD="${1:-}"; shift || true
+
+case "$CMD" in
+
+version)
+  cat <<EOF
+Product version: Plesk Obsidian 18.0.79 (test dugumu)
+     OS version: Debian 12 $(uname -m)
+     Build date: 2026/07/30
+       Revision: pleskclone-test
+EOF
+  exit 0 ;;
+
+db)
+  SQL=""
+  while (( $# )); do
+    case "$1" in
+      -*) shift ;;
+      *)  SQL="$1"; shift ;;
+    esac
+  done
+  [[ -z "$SQL" ]] && exit 0
+  mysql_root -N -B "$PSA_DB" -e "$SQL"
+  exit $? ;;
+
+sbin)
+  TOOL="${1:-}"; shift || true
+  case "$TOOL" in
+    statistics) exit 0 ;;   # istatistik hesaplama: no-op
+    *)          exit 0 ;;
+  esac ;;
+
+repair)
+  # plesk repair fs|mail <domain> -y
+  WHAT="${1:-}"; shift || true
+  DOMAIN="${1:-}"
+  case "$WHAT" in
+    fs)
+      [[ -n "$DOMAIN" ]] || exit 0
+      SU="$(dom_sys "$DOMAIN")"
+      [[ -n "$SU" ]] && chown -R "$SU":psacln "$VHOST_ROOT/$DOMAIN" 2>/dev/null
+      exit 0 ;;
+    mail) exit 0 ;;
+    *)    exit 0 ;;
+  esac ;;
+
+bin)
+  TOOL="${1:-}"; shift || true
+  ;;
+
+*)
+  die "Unknown command: $CMD" ;;
+esac
+
+# ===========================================================================
+# plesk bin <tool>
+# ===========================================================================
+case "$TOOL" in
+
+# ---------------------------------------------------------------------------
+domain)
+  ACTION="${1:-}"; shift || true
+  case "$ACTION" in
+
+    --info|-i)
+      DOMAIN="${1:-}"
+      ID="$(dom_id "$DOMAIN")"
+      [[ -z "$ID" ]] && { printf 'Domain does not exist: %s\n' "$DOMAIN" >&2; exit 1; }
+      printf 'Domain name: %s\n' "$DOMAIN"
+      printf 'Owner: %s\n'  "$(q1 "SELECT c.login FROM clients c JOIN domains d ON d.cl_id=c.id WHERE d.id=$ID;")"
+      printf 'Service plan: %s\n' "$(q1 "SELECT t.name FROM Templates t
+             JOIN PlansSubscriptions ps ON ps.plan_id=t.id
+             JOIN Subscriptions s ON s.id=ps.subscription_id
+             WHERE s.object_id=$ID AND s.object_type='domain' LIMIT 1;")"
+      printf 'IP address: %s\n' "$(q1 "SELECT ia.ip_address FROM DomainServices ds JOIN IpAddressesCollections ic ON ic.ipCollectionId=ds.ipCollectionId JOIN IP_Addresses ia ON ia.id=ic.ipAddressId WHERE ds.dom_id=$ID LIMIT 1;")"
+      printf 'Hosting type: Website hosting\n'
+      exit 0 ;;
+
+    --create)
+      DOMAIN="${1:-}"; shift || true
+      [[ -n "$DOMAIN" ]] || die "domain name required"
+      [[ -n "$(dom_id "$DOMAIN")" ]] && die "Domain already exists: $DOMAIN"
+
+      OWNER="$(argval owner "$@" || printf 'admin')"
+      PLAN="$(argval service-plan "$@" || printf 'Default Domain')"
+      IP="$(argval ip "$@" || printf '')"
+      LOGIN="$(argval login "$@" || printf '')"
+      PASSWD="$(argval passwd "$@" || printf '')"
+
+      CLID="$(q1 "SELECT id FROM clients WHERE login='$(esc "$OWNER")' LIMIT 1;")"
+      [[ -z "$CLID" ]] && { q "INSERT INTO clients (login,type) VALUES ('$(esc "$OWNER")','client');"; CLID="$(q1 "SELECT id FROM clients WHERE login='$(esc "$OWNER")';")"; }
+
+      PLANID="$(q1 "SELECT id FROM Templates WHERE name='$(esc "$PLAN")' AND type='domain' LIMIT 1;")"
+      [[ -z "$PLANID" ]] && die "Service plan does not exist: $PLAN"
+
+      IPID="$(ensure_ip "$IP")"
+      HOME_DIR="$VHOST_ROOT/$DOMAIN"
+
+      # Sistem kullanicisi (gercek)
+      if [[ -n "$LOGIN" ]]; then
+        if ! id "$LOGIN" >/dev/null 2>&1; then
+          useradd -M -d "$HOME_DIR" -g psacln -s /bin/false "$LOGIN" 2>/dev/null \
+            || die "Cannot create system user: $LOGIN"
+          [[ -n "$PASSWD" ]] && printf '%s:%s\n' "$LOGIN" "$PASSWD" | chpasswd 2>/dev/null
+        fi
+      fi
+
+      # Dizinler (gercek)
+      mkdir -p "$HOME_DIR"/{httpdocs,logs,private,cgi-bin,error_docs,tmp,anon_ftp}
+      [[ -n "$LOGIN" ]] && chown -R "$LOGIN":psacln "$HOME_DIR" 2>/dev/null
+      chmod 750 "$HOME_DIR" 2>/dev/null
+      chmod 755 "$HOME_DIR/httpdocs" 2>/dev/null
+
+      # psa kayitlari
+      # LAST_INSERT_ID() oturuma bagli: ekleme ve kullanim TEK sorguda olmali
+      q "INSERT INTO accounts (type,password) VALUES ('plain','$(esc "$PASSWD")');
+         INSERT INTO sys_users (login,account_id,home,shell)
+         VALUES ('$(esc "$LOGIN")',LAST_INSERT_ID(),'$(esc "$HOME_DIR")','/bin/false');"
+      SUID="$(q1 "SELECT id FROM sys_users WHERE login='$(esc "$LOGIN")';")"
+
+      q "INSERT INTO dns_zone (name) VALUES ('$(esc "$DOMAIN")');"
+      ZID="$(q1 "SELECT id FROM dns_zone WHERE name='$(esc "$DOMAIN")' ORDER BY id DESC LIMIT 1;")"
+      GUID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16)"
+      q "INSERT INTO domains (name,cl_id,dns_zone_id,guid) VALUES ('$(esc "$DOMAIN")',$CLID,$ZID,'$GUID');"
+      DID="$(dom_id "$DOMAIN")"
+
+      # Plan bagi: Subscriptions + PlansSubscriptions (gercek Plesk semasi)
+      q "INSERT INTO Subscriptions (object_id,object_type) VALUES ($DID,'domain');
+         INSERT INTO PlansSubscriptions (subscription_id,plan_id) VALUES (LAST_INSERT_ID(),$PLANID);"
+
+      DEFH="$(q1 "SELECT id FROM php_handlers ORDER BY id DESC LIMIT 1;")"
+      q "INSERT INTO hosting (dom_id,sys_user_id,www_root,php_handler_id)
+         VALUES ($DID,$SUID,'httpdocs','$(esc "$DEFH")');"
+
+      COLL="$(q1 "SELECT IFNULL(MAX(ipCollectionId),0)+1 FROM IpAddressesCollections;")"
+      q "INSERT INTO IpAddressesCollections (ipCollectionId,ipAddressId) VALUES ($COLL,$IPID);"
+      q "INSERT INTO DomainServices (dom_id,ipCollectionId,type) VALUES ($DID,$COLL,'web');"
+
+      # Varsayilan DNS kayitlari
+      IPADDR="$(q1 "SELECT ip_address FROM IP_Addresses WHERE id=$IPID;")"
+      q "INSERT INTO dns_recs (dns_zone_id,type,host,val,opt,displayHost,displayVal) VALUES
+          ($ZID,'A','$(esc "$DOMAIN").','$IPADDR','','','' ),
+          ($ZID,'A','www.$(esc "$DOMAIN").','$IPADDR','','',''),
+          ($ZID,'MX','$(esc "$DOMAIN").','mail.$(esc "$DOMAIN").','10','','');"
+
+      printf 'SUCCESS: Creation of domain %s completed.\n' "$DOMAIN"
+      exit 0 ;;
+
+    --update)
+      DOMAIN="${1:-}"; shift || true
+      DID="$(dom_id "$DOMAIN")"
+      [[ -z "$DID" ]] && die "Domain does not exist: $DOMAIN"
+
+      if H="$(argval php-handler-id "$@")"; then
+        [[ -z "$(q1 "SELECT id FROM php_handlers WHERE id='$(esc "$H")';")" ]] && die "Unknown PHP handler: $H"
+        q "UPDATE hosting SET php_handler_id='$(esc "$H")' WHERE dom_id=$DID;"
+      fi
+      if V="$(argval php-version "$@")"; then
+        HID="$(q1 "SELECT id FROM php_handlers WHERE CONCAT(version,'.',custom_version)='$(esc "$V")' OR version='$(esc "$V")' LIMIT 1;")"
+        [[ -z "$HID" ]] && die "Unknown PHP version: $V"
+        q "UPDATE hosting SET php_handler_id='$(esc "$HID")' WHERE dom_id=$DID;"
+      fi
+      if S="$(argval shell "$@")"; then
+        [[ "$S" == "false" ]] && S="/bin/false"
+        q "UPDATE sys_users su JOIN hosting h ON h.sys_user_id=su.id SET su.shell='$(esc "$S")' WHERE h.dom_id=$DID;"
+        SU="$(dom_sys "$DOMAIN")"
+        [[ -n "$SU" ]] && usermod -s "$S" "$SU" 2>/dev/null
+      fi
+      exit 0 ;;
+
+    --remove)
+      DOMAIN="${1:-}"
+      DID="$(dom_id "$DOMAIN")"
+      [[ -z "$DID" ]] && exit 1
+      SU="$(dom_sys "$DOMAIN")"
+      # veritabanlari
+      for db in $(q "SELECT name FROM data_bases WHERE dom_id=$DID;"); do
+        mysql_root -e "DROP DATABASE IF EXISTS \`$db\`;" 2>/dev/null
+      done
+      for u in $(q "SELECT du.login FROM db_users du JOIN data_bases d ON d.id=du.db_id WHERE d.dom_id=$DID;"); do
+        for h in $(mysql_root -N -B -e "SELECT host FROM mysql.user WHERE user='$(esc "$u")';" 2>/dev/null); do
+          mysql_root -e "DROP USER IF EXISTS '$(esc "$u")'@'$h';" 2>/dev/null
+        done
+      done
+      q "DELETE du FROM db_users du JOIN data_bases d ON d.id=du.db_id WHERE d.dom_id=$DID;"
+      q "DELETE FROM data_bases WHERE dom_id=$DID;"
+      # alt alan adlari
+      for sd in $(q "SELECT name FROM domains WHERE parentDomainId=$DID;"); do
+        SDID="$(dom_id "$sd")"
+        q "DELETE FROM hosting WHERE dom_id=$SDID; DELETE FROM domains WHERE id=$SDID;"
+      done
+      q "DELETE FROM domain_aliases WHERE dom_id=$DID;"
+      q "DELETE FROM mail WHERE dom_id=$DID;"
+      q "DELETE FROM disk_usage WHERE dom_id=$DID;"
+      q "DELETE FROM dom_param WHERE dom_id=$DID;"
+      q "DELETE dr FROM dns_recs dr JOIN domains d ON d.dns_zone_id=dr.dns_zone_id WHERE d.id=$DID;"
+      q "DELETE ds FROM DomainServices ds WHERE ds.dom_id=$DID;"
+      q "DELETE ps FROM PlansSubscriptions ps JOIN Subscriptions s ON s.id=ps.subscription_id
+         WHERE s.object_id=$DID AND s.object_type='domain';"
+      q "DELETE FROM Subscriptions WHERE object_id=$DID AND object_type='domain';"
+      q "DELETE FROM hosting WHERE dom_id=$DID;"
+      q "DELETE FROM domains WHERE id=$DID;"
+      if [[ -n "$SU" ]]; then
+        crontab -r -u "$SU" 2>/dev/null
+        userdel "$SU" 2>/dev/null
+        q "DELETE FROM sys_users WHERE login='$(esc "$SU")';"
+      fi
+      rm -rf "${VHOST_ROOT:?}/$DOMAIN"
+      printf 'SUCCESS: Removal of domain %s completed.\n' "$DOMAIN"
+      exit 0 ;;
+
+    *) die "Unknown domain action: $ACTION" ;;
+  esac ;;
+
+# ---------------------------------------------------------------------------
+subscription)
+  ACTION="${1:-}"; shift || true
+  case "$ACTION" in
+    --info|-i)
+      DOMAIN="${1:-}"
+      ID="$(dom_id "$DOMAIN")"; [[ -z "$ID" ]] && exit 1
+      printf 'Service plan: %s\n' "$(q1 "SELECT t.name FROM Templates t
+             JOIN PlansSubscriptions ps ON ps.plan_id=t.id
+             JOIN Subscriptions s ON s.id=ps.subscription_id
+             WHERE s.object_id=$ID AND s.object_type='domain' LIMIT 1;")"
+      exit 0 ;;
+    *) exit 1 ;;
+  esac ;;
+
+subscription_settings)
+  # Yetenek sorgusu icin kullanim metni
+  cat <<'EOF'
+Usage: subscription_settings <command> [options]
+  --update <name> -sync-subscription <name>
+EOF
+  exit 0 ;;
+
+# ---------------------------------------------------------------------------
+database)
+  ACTION="${1:-}"; shift || true
+  case "$ACTION" in
+
+    --help|-h)
+      cat <<'EOF'
+Usage: database <command> [options]
+  --create <name> -domain <domain> -type mysql -server <server>
+  --create-dbuser <name> -passwd <pass> -database <db> -domain <domain> [-access-hosts <hosts>]
+  --update-dbuser <name> -passwd <pass> -database <db> -domain <domain>
+  --remove <name> -domain <domain>
+EOF
+      exit 0 ;;
+
+    --create)
+      NAME="${1:-}"; shift || true
+      DOMAIN="$(argval domain "$@" || printf '')"
+      DID="$(dom_id "$DOMAIN")"; [[ -z "$DID" ]] && die "Domain does not exist: $DOMAIN"
+      [[ -n "$(q1 "SELECT id FROM data_bases WHERE name='$(esc "$NAME")';")" ]] && die "Database already exists: $NAME"
+      mysql_root -e "CREATE DATABASE IF NOT EXISTS \`$NAME\` DEFAULT CHARSET utf8mb4;" || die "Cannot create database"
+      q "INSERT INTO data_bases (name,dom_id,type,db_server_id) VALUES ('$(esc "$NAME")',$DID,'mysql',1);"
+      printf 'SUCCESS: Creation of database %s completed.\n' "$NAME"
+      exit 0 ;;
+
+    --create-dbuser)
+      LOGIN="${1:-}"; shift || true
+      PASS="$(argval passwd "$@" || printf '')"
+      DB="$(argval database "$@" || printf '')"
+      HOSTS="$(argval access-hosts "$@" || printf 'localhost')"
+      DBID="$(q1 "SELECT id FROM data_bases WHERE name='$(esc "$DB")' LIMIT 1;")"
+      [[ -z "$DBID" ]] && die "Database does not exist: $DB"
+      IFS=',' read -ra HL <<<"$HOSTS"
+      for h in "${HL[@]}"; do
+        [[ -z "$h" ]] && continue
+        mysql_root -e "CREATE USER IF NOT EXISTS '$(esc "$LOGIN")'@'$(esc "$h")' IDENTIFIED BY '$(esc "$PASS")';
+                       GRANT ALL PRIVILEGES ON \`$DB\`.* TO '$(esc "$LOGIN")'@'$(esc "$h")';" \
+          || die "Cannot create db user: $LOGIN@$h"
+      done
+      mysql_root -e "FLUSH PRIVILEGES;"
+      q "INSERT INTO accounts (type,password) VALUES ('plain','$(esc "$PASS")');
+         INSERT INTO db_users (login,db_id,account_id)
+         VALUES ('$(esc "$LOGIN")',$DBID,LAST_INSERT_ID());"
+      printf 'SUCCESS: Creation of database user %s completed.\n' "$LOGIN"
+      exit 0 ;;
+
+    --update-dbuser)
+      LOGIN="${1:-}"; shift || true
+      PASS="$(argval passwd "$@" || printf '')"
+      DB="$(argval database "$@" || printf '')"
+      for h in $(mysql_root -N -B -e "SELECT host FROM mysql.user WHERE user='$(esc "$LOGIN")';" 2>/dev/null); do
+        mysql_root -e "ALTER USER '$(esc "$LOGIN")'@'$h' IDENTIFIED BY '$(esc "$PASS")';" 2>/dev/null
+      done
+      mysql_root -e "FLUSH PRIVILEGES;"
+      DBID="$(q1 "SELECT id FROM data_bases WHERE name='$(esc "$DB")' LIMIT 1;")"
+      q "UPDATE accounts a JOIN db_users du ON du.account_id=a.id
+         SET a.password='$(esc "$PASS")', a.type='plain'
+         WHERE du.login='$(esc "$LOGIN")' AND du.db_id=$DBID;"
+      printf 'SUCCESS: Update of database user %s completed.\n' "$LOGIN"
+      exit 0 ;;
+
+    --remove)
+      NAME="${1:-}"
+      mysql_root -e "DROP DATABASE IF EXISTS \`$NAME\`;" 2>/dev/null
+      DBID="$(q1 "SELECT id FROM data_bases WHERE name='$(esc "$NAME")';")"
+      [[ -n "$DBID" ]] && q "DELETE FROM db_users WHERE db_id=$DBID; DELETE FROM data_bases WHERE id=$DBID;"
+      exit 0 ;;
+
+    *) die "Unknown database action: $ACTION" ;;
+  esac ;;
+
+# ---------------------------------------------------------------------------
+site)
+  ACTION="${1:-}"; shift || true
+  case "$ACTION" in
+    --update)
+      DOMAIN="${1:-}"; shift || true
+      DID="$(dom_id "$DOMAIN")"; [[ -z "$DID" ]] && die "Domain does not exist: $DOMAIN"
+      if CN="$(argval certificate-name "$@")"; then
+        CID="$(q1 "SELECT id FROM certificates WHERE name='$(esc "$CN")' LIMIT 1;")"
+        [[ -z "$CID" ]] && die "Certificate does not exist: $CN"
+        q "UPDATE domains SET certificate_id=$CID WHERE id=$DID;"
+      fi
+      exit 0 ;;
+    *) exit 0 ;;
+  esac ;;
+
+# ---------------------------------------------------------------------------
+site_alias)
+  ACTION="${1:-}"; shift || true
+  case "$ACTION" in
+    --create)
+      ALIAS="${1:-}"; shift || true
+      DOMAIN="$(argval domain "$@" || printf '')"
+      DID="$(dom_id "$DOMAIN")"; [[ -z "$DID" ]] && die "Domain does not exist: $DOMAIN"
+      [[ -n "$(q1 "SELECT id FROM domain_aliases WHERE name='$(esc "$ALIAS")';")" ]] && die "Alias already exists"
+      q "INSERT INTO domain_aliases (name,dom_id) VALUES ('$(esc "$ALIAS")',$DID);"
+      printf 'SUCCESS: Creation of domain alias %s completed.\n' "$ALIAS"
+      exit 0 ;;
+    *) exit 1 ;;
+  esac ;;
+
+# ---------------------------------------------------------------------------
+subdomain)
+  ACTION="${1:-}"; shift || true
+  case "$ACTION" in
+    --info|-i)
+      NAME="${1:-}"
+      [[ -n "$(dom_id "$NAME")" ]] || exit 1
+      printf 'Subdomain: %s\n' "$NAME"; exit 0 ;;
+    --create)
+      PREFIX="${1:-}"; shift || true
+      DOMAIN="$(argval domain "$@" || printf '')"
+      WWWROOT="$(argval www-root "$@" || printf "$PREFIX")"
+      PDID="$(dom_id "$DOMAIN")"; [[ -z "$PDID" ]] && die "Parent domain does not exist: $DOMAIN"
+      FULL="$PREFIX.$DOMAIN"
+      [[ -n "$(dom_id "$FULL")" ]] && die "Subdomain already exists: $FULL"
+      CLID="$(q1 "SELECT cl_id FROM domains WHERE id=$PDID;")"
+      ZID="$(q1 "SELECT dns_zone_id FROM domains WHERE id=$PDID;")"
+      SUID="$(q1 "SELECT sys_user_id FROM hosting WHERE dom_id=$PDID;")"
+      PHPH="$(q1 "SELECT php_handler_id FROM hosting WHERE dom_id=$PDID;")"
+      GUID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16)"
+      q "INSERT INTO domains (name,cl_id,dns_zone_id,guid,parentDomainId) VALUES ('$(esc "$FULL")',$CLID,$ZID,'$GUID',$PDID);"
+      SDID="$(dom_id "$FULL")"
+      q "INSERT INTO hosting (dom_id,sys_user_id,www_root,php_handler_id) VALUES ($SDID,$SUID,'$(esc "$WWWROOT")','$(esc "$PHPH")');"
+      mkdir -p "$VHOST_ROOT/$DOMAIN/$WWWROOT"
+      SU="$(dom_sys "$DOMAIN")"; [[ -n "$SU" ]] && chown -R "$SU":psacln "$VHOST_ROOT/$DOMAIN/$WWWROOT" 2>/dev/null
+      printf 'SUCCESS: Creation of subdomain %s completed.\n' "$FULL"
+      exit 0 ;;
+    *) exit 1 ;;
+  esac ;;
+
+# ---------------------------------------------------------------------------
+mail)
+  ACTION="${1:-}"; shift || true
+  ADDR="${1:-}"; shift || true
+  NAME="${ADDR%%@*}"; DOMAIN="${ADDR#*@}"
+  DID="$(dom_id "$DOMAIN")"; [[ -z "$DID" ]] && die "Domain does not exist: $DOMAIN"
+  PASS="$(argval passwd "$@" || printf '')"
+  case "$ACTION" in
+    --create)
+      [[ -n "$(q1 "SELECT id FROM mail WHERE mail_name='$(esc "$NAME")' AND dom_id=$DID;")" ]] && die "Mailbox already exists"
+      q "INSERT INTO accounts (type,password) VALUES ('plain','$(esc "$PASS")');
+         INSERT INTO mail (mail_name,dom_id,account_id)
+         VALUES ('$(esc "$NAME")',$DID,LAST_INSERT_ID());"
+      mkdir -p "/var/qmail/mailnames/$DOMAIN/$NAME/Maildir"/{cur,new,tmp}
+      printf 'SUCCESS: Creation of mailbox %s completed.\n' "$ADDR"
+      exit 0 ;;
+    --update)
+      q "UPDATE accounts a JOIN mail m ON m.account_id=a.id SET a.password='$(esc "$PASS")' WHERE m.mail_name='$(esc "$NAME")' AND m.dom_id=$DID;"
+      exit 0 ;;
+    *) exit 1 ;;
+  esac ;;
+
+# ---------------------------------------------------------------------------
+ftpsubaccount)
+  ACTION="${1:-}"; shift || true
+  case "$ACTION" in
+    --create)
+      LOGIN="${1:-}"; shift || true
+      DOMAIN="$(argval domain "$@" || printf '')"
+      PASS="$(argval passwd "$@" || printf '')"
+      HOMEP="$(argval home "$@" || printf '/')"
+      DID="$(dom_id "$DOMAIN")"; [[ -z "$DID" ]] && die "Domain does not exist: $DOMAIN"
+      id "$LOGIN" >/dev/null 2>&1 && die "User already exists: $LOGIN"
+      FULLHOME="$VHOST_ROOT/$DOMAIN${HOMEP}"
+      useradd -M -d "$FULLHOME" -g psacln -s /bin/false "$LOGIN" 2>/dev/null || die "Cannot create ftp user"
+      [[ -n "$PASS" ]] && printf '%s:%s\n' "$LOGIN" "$PASS" | chpasswd 2>/dev/null
+      q "INSERT INTO accounts (type,password) VALUES ('plain','$(esc "$PASS")');
+         INSERT INTO sys_users (login,account_id,home,shell)
+         VALUES ('$(esc "$LOGIN")',LAST_INSERT_ID(),'$(esc "$FULLHOME")','/bin/false');"
+      printf 'SUCCESS: Creation of FTP subaccount %s completed.\n' "$LOGIN"
+      exit 0 ;;
+    *) exit 1 ;;
+  esac ;;
+
+# ---------------------------------------------------------------------------
+dns)
+  ACTION="${1:-}"; shift || true
+  case "$ACTION" in
+    --add)
+      DOMAIN="${1:-}"; shift || true
+      DID="$(dom_id "$DOMAIN")"; [[ -z "$DID" ]] && die "Domain does not exist: $DOMAIN"
+      ZID="$(q1 "SELECT dns_zone_id FROM domains WHERE id=$DID;")"
+      TYPE=""; HOST=""; VAL=""; OPT=""
+      if H="$(argval a "$@")";      then TYPE=A;     HOST="$H"; VAL="$(argval ip "$@" || printf '')"; fi
+      if [[ -z "$TYPE" ]] && H="$(argval aaaa "$@")"; then TYPE=AAAA; HOST="$H"; VAL="$(argval ip "$@" || printf '')"; fi
+      if [[ -z "$TYPE" ]] && H="$(argval cname "$@")"; then TYPE=CNAME; HOST="$H"; VAL="$(argval canonical "$@" || printf '')"; fi
+      if [[ -z "$TYPE" ]] && H="$(argval mx "$@")"; then TYPE=MX; HOST="$H"; VAL="$(argval mailexchanger "$@" || printf '')"; OPT="$(argval priority "$@" || printf '10')"; fi
+      if [[ -z "$TYPE" ]] && H="$(argval txt "$@")"; then TYPE=TXT; VAL="$H"; HOST="$(argval domain-name "$@" || printf '')"; fi
+      if [[ -z "$TYPE" ]] && H="$(argval srv "$@")"; then TYPE=SRV; HOST="$H"; VAL="$(argval canonical "$@" || printf '')"; OPT="$(argval priority "$@" || printf '0')"; fi
+      if [[ -z "$TYPE" ]] && H="$(argval ptr "$@")"; then TYPE=PTR; VAL="$H"; HOST="$(argval canonical "$@" || printf '')"; fi
+      [[ -z "$TYPE" ]] && die "Unknown record type"
+      FQDN="$DOMAIN."
+      [[ -n "$HOST" ]] && FQDN="$HOST.$DOMAIN."
+      [[ -n "$(q1 "SELECT id FROM dns_recs WHERE dns_zone_id=$ZID AND type='$TYPE' AND host='$(esc "$FQDN")' AND val='$(esc "$VAL")';")" ]] \
+        && die "DNS record already exists"
+      q "INSERT INTO dns_recs (dns_zone_id,type,host,val,opt,displayHost,displayVal)
+         VALUES ($ZID,'$TYPE','$(esc "$FQDN")','$(esc "$VAL")','$(esc "$OPT")','','');"
+      printf 'SUCCESS: DNS record was successfully added.\n'
+      exit 0 ;;
+    *) exit 1 ;;
+  esac ;;
+
+# ---------------------------------------------------------------------------
+certificate)
+  ACTION="${1:-}"; shift || true
+  NAME="${1:-}"; shift || true
+  CERTF="$(argval cert-file "$@" || printf '')"
+  KEYF="$(argval key-file "$@" || printf '')"
+  CAF="$(argval cacert-file "$@" || printf '')"
+  case "$ACTION" in
+    --create|--update)
+      [[ -f "$CERTF" && -f "$KEYF" ]] || die "Certificate files not found"
+      CERT="$(sed "s/'/''/g" "$CERTF")"
+      PVT="$(sed "s/'/''/g" "$KEYF")"
+      CA=""; [[ -f "$CAF" ]] && CA="$(sed "s/'/''/g" "$CAF")"
+      exec_sql "INSERT INTO certificates (name,cert,pvt,ca) VALUES ('$(esc "$NAME")','$CERT','$PVT','$CA')
+                ON DUPLICATE KEY UPDATE cert=VALUES(cert), pvt=VALUES(pvt), ca=VALUES(ca);" >/dev/null \
+        || die "Cannot store certificate"
+      printf 'SUCCESS: Certificate %s stored.\n' "$NAME"
+      exit 0 ;;
+    *) exit 1 ;;
+  esac ;;
+
+# ---------------------------------------------------------------------------
+extension)
+  # plesk bin extension --exec letsencrypt cli.php -d DOMAIN -m MAIL --agree-tos
+  if [[ "${1:-}" == "--exec" && "${2:-}" == "letsencrypt" ]]; then
+    shift 3 || true
+    DOMAIN="$(argval d "$@" || printf '')"
+    [[ -z "$DOMAIN" ]] && die "domain required"
+    DID="$(dom_id "$DOMAIN")"; [[ -z "$DID" ]] && die "Domain does not exist: $DOMAIN"
+    TMPD="$(mktemp -d)"
+    openssl req -x509 -newkey rsa:2048 -nodes -days 90 \
+      -keyout "$TMPD/k.pem" -out "$TMPD/c.pem" -subj "/CN=$DOMAIN/O=Test LE" >/dev/null 2>&1 \
+      || { rm -rf "$TMPD"; die "Cannot generate certificate"; }
+    CERT="$(sed "s/'/''/g" "$TMPD/c.pem")"; PVT="$(sed "s/'/''/g" "$TMPD/k.pem")"
+    exec_sql "INSERT INTO certificates (name,cert,pvt,ca) VALUES ('Lets Encrypt $(esc "$DOMAIN")','$CERT','$PVT','')
+              ON DUPLICATE KEY UPDATE cert=VALUES(cert), pvt=VALUES(pvt);" >/dev/null
+    CID="$(q1 "SELECT id FROM certificates WHERE name='Lets Encrypt $(esc "$DOMAIN")';")"
+    q "UPDATE domains SET certificate_id=$CID WHERE id=$DID;"
+    rm -rf "$TMPD"
+    printf "Certificate for %s was issued.\n" "$DOMAIN"
+    exit 0
+  fi
+  exit 1 ;;
+
+# ---------------------------------------------------------------------------
+php_handler)
+  # Gercek Plesk ciktisi ile ayni sutun duzeni:
+  # id / display name / full version / version / type ...
+  if [[ "${1:-}" == "--list" || "${1:-}" == "-l" ]]; then
+    printf '%24s  %13s  %13s  %9s  %8s\n' "id:" "display name:" "full version:" "version:" "type:"
+    q "SELECT id, display_name, CONCAT(version,'.',custom_version), version FROM php_handlers ORDER BY id;" \
+      | while IFS=$'\t' read -r hid disp full ver; do
+          [[ -z "$hid" ]] && continue
+          typ="${hid##*-}"
+          printf '%24s  %13s  %13s  %9s  %8s\n' "$hid" "$full" "$full" "$ver" "$typ"
+        done
+    exit 0
+  fi
+  exit 1 ;;
+
+# ---------------------------------------------------------------------------
+pleskbackup)
+  # --domains-name <domain> --output-file=<path> [--skip-logs]
+  if [[ "${1:-}" == "--help" ]]; then printf -- '--skip-logs\n'; exit 0; fi
+  DOMAIN=""; OUT=""
+  while (( $# )); do
+    case "$1" in
+      --domains-name) DOMAIN="${2:-}"; shift 2 ;;
+      --output-file=*) OUT="${1#--output-file=}"; shift ;;
+      --output-file) OUT="${2:-}"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [[ -n "$DOMAIN" && -n "$OUT" ]] || die "usage: pleskbackup --domains-name D --output-file=F"
+  DID="$(dom_id "$DOMAIN")"; [[ -z "$DID" ]] && die "Domain does not exist: $DOMAIN"
+  STAGE="$(mktemp -d)"
+  mkdir -p "$STAGE/dbs"
+  printf 'domain=%s\n' "$DOMAIN" > "$STAGE/meta.env"
+  printf 'sysuser=%s\n' "$(dom_sys "$DOMAIN")" >> "$STAGE/meta.env"
+  printf 'plan=%s\n' "$(q1 "SELECT t.name FROM Templates t
+        JOIN PlansSubscriptions ps ON ps.plan_id=t.id
+        JOIN Subscriptions s ON s.id=ps.subscription_id
+        WHERE s.object_id=$DID AND s.object_type='domain' LIMIT 1;")" >> "$STAGE/meta.env"
+  printf 'owner=%s\n' "$(q1 "SELECT c.login FROM clients c JOIN domains d ON d.cl_id=c.id WHERE d.id=$DID;")" >> "$STAGE/meta.env"
+  printf 'shell=%s\n' "$(q1 "SELECT su.shell FROM sys_users su JOIN hosting h ON h.sys_user_id=su.id WHERE h.dom_id=$DID;")" >> "$STAGE/meta.env"
+  for db in $(q "SELECT name FROM data_bases WHERE dom_id=$DID;"); do
+    mysql_admin --single-transaction --routines --triggers "$db" 2>/dev/null | gzip > "$STAGE/dbs/$db.sql.gz" \
+      || MYSQL_PWD="$(adminpw)" mysqldump -uadmin --single-transaction --routines --triggers "$db" 2>/dev/null | gzip > "$STAGE/dbs/$db.sql.gz"
+    printf '%s\n' "$db" >> "$STAGE/dbs/list.txt"
+    q "SELECT du.login, a.password FROM db_users du JOIN accounts a ON a.id=du.account_id JOIN data_bases d ON d.id=du.db_id WHERE d.name='$(esc "$db")';" \
+      | awk -v d="$db" '{print d"\t"$1"\t"$2}' >> "$STAGE/dbs/users.tsv"
+  done
+  tar -czf "$STAGE/vhost.tar.gz" -C "$VHOST_ROOT" "$DOMAIN" 2>/dev/null
+  crontab -l -u "$(dom_sys "$DOMAIN")" 2>/dev/null > "$STAGE/crontab.txt"
+  tar -czf "$OUT" -C "$STAGE" . || die "Cannot create backup"
+  rm -rf "$STAGE"
+  printf 'Backup of %s created: %s\n' "$DOMAIN" "$OUT"
+  exit 0 ;;
+
+pleskrestore)
+  if [[ "${1:-}" == "--create-map" ]]; then
+    MF="$(argval map-file "$@" || printf '/tmp/plesk-map.xml')"
+    printf '<?xml version="1.0"?>\n<map/>\n' > "$MF"
+    exit 0
+  fi
+  if [[ "${1:-}" == "--restore" ]]; then
+    BK="${2:-}"
+    [[ -f "$BK" ]] || die "Backup not found: $BK"
+    STAGE="$(mktemp -d)"
+    tar -xzf "$BK" -C "$STAGE" || die "Cannot extract backup"
+    . "$STAGE/meta.env"
+    if [[ -z "$(dom_id "$domain")" ]]; then
+      PLANOK="$(q1 "SELECT name FROM Templates WHERE name='$(esc "$plan")' AND type='domain';")"
+      [[ -z "$PLANOK" ]] && plan="$(q1 "SELECT name FROM Templates WHERE type='domain' ORDER BY id LIMIT 1;")"
+      "$0" bin domain --create "$domain" -owner "$owner" -service-plan "$plan" \
+           -login "$sysuser" -passwd "Restored#$(openssl rand -hex 4)" -hosting true >/dev/null \
+        || die "Cannot create domain during restore"
+    fi
+    DID="$(dom_id "$domain")"
+    rm -rf "${VHOST_ROOT:?}/$domain"
+    tar -xzf "$STAGE/vhost.tar.gz" -C "$VHOST_ROOT"
+    if [[ -f "$STAGE/dbs/list.txt" ]]; then
+      while read -r db; do
+        [[ -z "$db" ]] && continue
+        "$0" bin database --create "$db" -domain "$domain" -type mysql -server localhost >/dev/null 2>&1
+        gunzip -c "$STAGE/dbs/$db.sql.gz" | MYSQL_PWD="$(adminpw)" mysql -uadmin "$db"
+      done < "$STAGE/dbs/list.txt"
+    fi
+    if [[ -f "$STAGE/dbs/users.tsv" ]]; then
+      while IFS=$'\t' read -r db login pass; do
+        [[ -z "$login" ]] && continue
+        "$0" bin database --create-dbuser "$login" -passwd "$pass" -database "$db" -domain "$domain" >/dev/null 2>&1
+      done < "$STAGE/dbs/users.tsv"
+    fi
+    [[ -s "$STAGE/crontab.txt" ]] && crontab -u "$sysuser" "$STAGE/crontab.txt" 2>/dev/null
+    [[ -n "$shell" ]] && "$0" bin domain --update "$domain" -shell "$shell" >/dev/null 2>&1
+    SU="$(dom_sys "$domain")"; [[ -n "$SU" ]] && chown -R "$SU":psacln "$VHOST_ROOT/$domain" 2>/dev/null
+    rm -rf "$STAGE"
+    printf 'Restore of %s completed.\n' "$domain"
+    exit 0
+  fi
+  exit 1 ;;
+
+# ---------------------------------------------------------------------------
+*)
+  die "Unknown utility: $TOOL" ;;
+esac
