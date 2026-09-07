@@ -134,7 +134,14 @@ get_docroot () {
     JOIN domains d ON d.id = h.dom_id
     WHERE d.name='$(sql_escape "$domain")' LIMIT 1;" 2>/dev/null)"
   [[ -z "$www_root" ]] && www_root="httpdocs"
-  printf '%s/%s' "${home%/}" "$www_root"
+  # Bazı Plesk kurulumlarında (örn. paylaşılan sys_user home'a sahip subdomain/ek
+  # domainlerde) www_root zaten mutlak yol olarak tutulur; bu durumda home ile
+  # birleştirmek yolu ikiye katlar, doğrudan kullan.
+  if [[ "$www_root" == /* ]]; then
+    printf '%s' "$www_root"
+  else
+    printf '%s/%s' "${home%/}" "$www_root"
+  fi
 }
 
 HOME_SRC="$(get_home_dir "$SOURCE")"
