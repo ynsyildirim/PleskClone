@@ -113,8 +113,38 @@ sql_escape () {
 SYSTEM_USER_SRC="$(get_system_user "$SOURCE")"
 [[ -z "$SYSTEM_USER_SRC" ]] && die "Kaynak sistem kullanıcısı okunamadı (PSA DB boş döndü). Domain adı doğru mu? Hosting atanmış mı?"
 
-DOCROOT_SRC="/var/www/vhosts/$SOURCE/httpdocs"
-DOCROOT_TGT="/var/www/vhosts/$TARGET/httpdocs"
+# Gerçek vhost home dizinini PSA'dan oku (addon/subdomain-as-domain gibi durumlarda
+# gerçek yol /var/www/vhosts/<domain>/ kalıbından farklı olabilir)
+get_home_dir () {
+  local domain="$1"
+  plesk db -Ne "
+    SELECT su.home
+    FROM sys_users su
+    JOIN hosting h ON h.sys_user_id = su.id
+    JOIN domains d ON d.id = h.dom_id
+    WHERE d.name='$(sql_escape "$domain")' LIMIT 1;" 2>/dev/null
+}
+
+get_docroot () {
+  local domain="$1" home="$2"
+  local www_root
+  www_root="$(plesk db -Ne "
+    SELECT h.www_root
+    FROM hosting h
+    JOIN domains d ON d.id = h.dom_id
+    WHERE d.name='$(sql_escape "$domain")' LIMIT 1;" 2>/dev/null)"
+  [[ -z "$www_root" ]] && www_root="httpdocs"
+  printf '%s/%s' "${home%/}" "$www_root"
+}
+
+HOME_SRC="$(get_home_dir "$SOURCE")"
+[[ -z "$HOME_SRC" ]] && HOME_SRC="/var/www/vhosts/$SOURCE"
+DOCROOT_SRC="$(get_docroot "$SOURCE" "$HOME_SRC")"
+[[ -d "$DOCROOT_SRC" ]] || die "Kaynak doküman kökü bulunamadı: $DOCROOT_SRC (domain bir subdomain/addon domain ise gerçek dosya yolu farklı olabilir, PSA'daki hosting kaydını kontrol edin)"
+
+# Hedef henüz oluşturulmadı; create_target_domain sonrası gerçek değerlerle güncellenecek
+HOME_TGT="/var/www/vhosts/$TARGET"
+DOCROOT_TGT="$HOME_TGT/httpdocs"
 
 IP_SRC="$(get_field "$SOURCE" "IP address")"
 [[ -z "$IP_SRC" ]] && IP_SRC="$(hostname -I | awk '{print $1}')"
@@ -276,9 +306,9 @@ sync_files () {
   local sys_tgt; sys_tgt="$(get_system_user "$TARGET")"
   if [[ -n "$sys_tgt" ]]; then
     info "Hedef dizin sahipliği ayarlanıyor: $sys_tgt"
-    chown "$sys_tgt":psacln "/var/www/vhosts/$TARGET" || true
+    chown "$sys_tgt":psacln "$HOME_TGT" || true
     chown "$sys_tgt":psacln "$DOCROOT_TGT" || true
-    chmod 755 "/var/www/vhosts/$TARGET" || true
+    chmod 755 "$HOME_TGT" || true
     chmod 755 "$DOCROOT_TGT" || true
   fi
   
@@ -342,8 +372,8 @@ replace_domain_in_files () {
 
 # copy composer directory and cache (optional)
 copy_composer () {
-  local src_composer="/var/www/vhosts/$SOURCE/.composer"
-  local tgt_composer="/var/www/vhosts/$TARGET/.composer"
+  local src_composer="$HOME_SRC/.composer"
+  local tgt_composer="$HOME_TGT/.composer"
   
   if [[ -d "$src_composer" ]]; then
     info "Composer klasörü kopyalanıyor: $src_composer -> $tgt_composer"
@@ -375,8 +405,8 @@ copy_composer () {
 copy_git () {
   [[ $COPY_GIT -eq 1 ]] || return
   
-  local git_src_plesk="/var/www/vhosts/$SOURCE/git"
-  local git_tgt_plesk="/var/www/vhosts/$TARGET/git"
+  local git_src_plesk="$HOME_SRC/git"
+  local git_tgt_plesk="$HOME_TGT/git"
   local git_repos_found=0
   
   # Önce Plesk Git entegrasyonu kontrol et (birden fazla repo olabilir)
@@ -438,7 +468,7 @@ copy_git () {
           
           if [[ "$is_bare" != "true" ]]; then
             info "Ana repository için çalışma dizini ayarlanıyor: $repo_name"
-            cd "/var/www/vhosts/$TARGET" || warn "Hedef dizine geçilemedi"
+            cd "$HOME_TGT" || warn "Hedef dizine geçilemedi"
             git --git-dir="$git_dir_path" --work-tree="$DOCROOT_TGT" reset --hard HEAD 2>/dev/null || warn "Git reset uyarı verdi: $repo_name"
             git --git-dir="$git_dir_path" --work-tree="$DOCROOT_TGT" clean -fd 2>/dev/null || warn "Git clean uyarı verdi: $repo_name"
           else
@@ -496,7 +526,7 @@ copy_git () {
 
 # Git repository'leri için sanal klasörler (symlink'ler) oluştur
 create_git_symlinks () {
-  local git_dir="/var/www/vhosts/$TARGET/git"
+  local git_dir="$HOME_TGT/git"
   
   if [[ ! -d "$git_dir" ]]; then
     return
@@ -750,7 +780,7 @@ fix_perms () {
   (( DRYRUN )) && return
   
   # Ana domain klasörünün izinlerini düzelt
-  local domain_root="/var/www/vhosts/$TARGET"
+  local domain_root="$HOME_TGT"
   if [[ -d "$domain_root" ]]; then
     chown "$sys_tgt":psacln "$domain_root" || true
     chmod 755 "$domain_root" || true
@@ -904,6 +934,9 @@ else
   (( DRYRUN )) && warn "DRY-RUN aktif (değişiklik yapılmayacak)"
 
   create_target_domain
+  HOME_TGT="$(get_home_dir "$TARGET")"
+  [[ -z "$HOME_TGT" ]] && HOME_TGT="/var/www/vhosts/$TARGET"
+  DOCROOT_TGT="$(get_docroot "$TARGET" "$HOME_TGT")"
   copy_php_handler
   copy_ssh_settings
   sync_files
