@@ -160,7 +160,10 @@ resolve_docroot () {
   candidate="/var/www/vhosts/$domain/httpdocs"
   if [[ -d "$candidate" ]]; then printf '%s' "$candidate"; return 0; fi
 
-  candidate="$(find /var/www/vhosts -mindepth 2 -maxdepth 2 -type d -iname "$domain" 2>/dev/null | head -n1)"
+  # -L: /var/www/vhosts/<parent> Plesk'te sık sık gerçek depolamaya (ör.
+  # /var/www/vhosts/system/<parent>) symlink olarak durur; -L olmadan find
+  # symlink'in içine inmez ve bu nested yapıyı asla bulamaz.
+  candidate="$(find -L /var/www/vhosts -mindepth 1 -maxdepth 3 -type d -iname "$domain" 2>/dev/null | head -n1)"
   if [[ -n "$candidate" ]]; then
     [[ -d "$candidate/httpdocs" ]] && candidate="$candidate/httpdocs"
     printf '%s' "$candidate"
@@ -173,7 +176,7 @@ resolve_docroot () {
 HOME_SRC="$(get_home_dir "$SOURCE")"
 [[ -z "$HOME_SRC" ]] && HOME_SRC="/var/www/vhosts/$SOURCE"
 if ! DOCROOT_SRC="$(resolve_docroot "$SOURCE" "$HOME_SRC")"; then
-  die "Kaynak doküman kökü bulunamadı. Denenenler: DB(home='$HOME_SRC' www_root='$(get_www_root_raw "$SOURCE")'), /var/www/vhosts/$SOURCE/httpdocs, /var/www/vhosts/*/$SOURCE(/httpdocs). Gerçek yolu bulmak için: find /var/www/vhosts -maxdepth 2 -iname '*$SOURCE*'"
+  die "Kaynak doküman kökü bulunamadı. Denenenler: DB(home='$HOME_SRC' www_root='$(get_www_root_raw "$SOURCE")'), /var/www/vhosts/$SOURCE/httpdocs, find -L /var/www/vhosts -mindepth 1 -maxdepth 3 -iname '$SOURCE'. Gerçek yolu bulmak için: find -L /var/www/vhosts -maxdepth 3 -iname '*$SOURCE*'"
 fi
 
 # Hedef henüz oluşturulmadı; create_target_domain sonrası gerçek değerlerle güncellenecek
