@@ -122,17 +122,21 @@ get_home_dir () {
     FROM sys_users su
     JOIN hosting h ON h.sys_user_id = su.id
     JOIN domains d ON d.id = h.dom_id
-    WHERE d.name='$(sql_escape "$domain")' LIMIT 1;" 2>/dev/null
+    WHERE d.name='$(sql_escape "$domain")' LIMIT 1;" 2>/dev/null | tr -d '\r' | head -n1
+}
+
+get_www_root_raw () {
+  local domain="$1"
+  plesk db -Ne "
+    SELECT h.www_root
+    FROM hosting h
+    JOIN domains d ON d.id = h.dom_id
+    WHERE d.name='$(sql_escape "$domain")' LIMIT 1;" 2>/dev/null | tr -d '\r' | head -n1
 }
 
 get_docroot () {
   local domain="$1" home="$2"
-  local www_root
-  www_root="$(plesk db -Ne "
-    SELECT h.www_root
-    FROM hosting h
-    JOIN domains d ON d.id = h.dom_id
-    WHERE d.name='$(sql_escape "$domain")' LIMIT 1;" 2>/dev/null)"
+  local www_root; www_root="$(get_www_root_raw "$domain")"
   [[ -z "$www_root" ]] && www_root="httpdocs"
   # Bazı Plesk kurulumlarında (örn. paylaşılan sys_user home'a sahip subdomain/ek
   # domainlerde) www_root zaten mutlak yol olarak tutulur; bu durumda home ile
@@ -144,10 +148,33 @@ get_docroot () {
   fi
 }
 
+# DB'den hesaplanan yolun dışında, gerçek dizin varlığını kontrol ederek
+# birkaç bilinen kalıbı dener; hiçbiri DB alanlarının garanti ettiği gibi
+# davranmasa bile diskte gerçekten var olan yolu bulmayı amaçlar.
+resolve_docroot () {
+  local domain="$1" home="$2" candidate
+
+  candidate="$(get_docroot "$domain" "$home")"
+  if [[ -d "$candidate" ]]; then printf '%s' "$candidate"; return 0; fi
+
+  candidate="/var/www/vhosts/$domain/httpdocs"
+  if [[ -d "$candidate" ]]; then printf '%s' "$candidate"; return 0; fi
+
+  candidate="$(find /var/www/vhosts -mindepth 2 -maxdepth 2 -type d -iname "$domain" 2>/dev/null | head -n1)"
+  if [[ -n "$candidate" ]]; then
+    [[ -d "$candidate/httpdocs" ]] && candidate="$candidate/httpdocs"
+    printf '%s' "$candidate"
+    return 0
+  fi
+
+  return 1
+}
+
 HOME_SRC="$(get_home_dir "$SOURCE")"
 [[ -z "$HOME_SRC" ]] && HOME_SRC="/var/www/vhosts/$SOURCE"
-DOCROOT_SRC="$(get_docroot "$SOURCE" "$HOME_SRC")"
-[[ -d "$DOCROOT_SRC" ]] || die "Kaynak doküman kökü bulunamadı: $DOCROOT_SRC (domain bir subdomain/addon domain ise gerçek dosya yolu farklı olabilir, PSA'daki hosting kaydını kontrol edin)"
+if ! DOCROOT_SRC="$(resolve_docroot "$SOURCE" "$HOME_SRC")"; then
+  die "Kaynak doküman kökü bulunamadı. Denenenler: DB(home='$HOME_SRC' www_root='$(get_www_root_raw "$SOURCE")'), /var/www/vhosts/$SOURCE/httpdocs, /var/www/vhosts/*/$SOURCE(/httpdocs). Gerçek yolu bulmak için: find /var/www/vhosts -maxdepth 2 -iname '*$SOURCE*'"
+fi
 
 # Hedef henüz oluşturulmadı; create_target_domain sonrası gerçek değerlerle güncellenecek
 HOME_TGT="/var/www/vhosts/$TARGET"
